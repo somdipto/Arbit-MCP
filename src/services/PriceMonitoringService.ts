@@ -1,19 +1,78 @@
 import { EventEmitter } from 'events';
-import { getRepository } from '@/config/database';
-import { PriceData, TokenPair, Exchange } from '@/models';
-import { PriceComparison, ExchangeType, SubnetType } from '@/types';
 import { logger } from '@/utils/logger';
-import { tradingConfig } from '@/config';
-import axios from 'axios';
+import { 
+  PriceData, 
+  PriceUpdate, 
+  MarketData, 
+  Exchange,
+  TokenPair 
+} from '@/types/arbitrage';
+import { DatabaseService } from './DatabaseService';
+import { MetricsService } from './MetricsService';
 
 export class PriceMonitoringService extends EventEmitter {
+  private database: DatabaseService;
+  private metrics: MetricsService;
   private isRunning: boolean = false;
   private priceCache: Map<string, PriceData> = new Map();
-  private lastUpdate: Date = new Date();
-  private updateInterval: NodeJS.Timeout | null = null;
+  private exchanges: Map<string, Exchange> = new Map();
+  private supportedPairs: TokenPair[] = [];
+  private updateInterval: number;
+  private maxPriceAge: number;
+  private priceSources: string[];
+  private confidenceThreshold: number;
 
-  constructor() {
+  constructor(database: DatabaseService, metrics: MetricsService) {
     super();
+    
+    this.database = database;
+    this.metrics = metrics;
+
+    // Load configuration from environment
+    this.updateInterval = parseInt(process.env.PRICE_UPDATE_INTERVAL || '1000');
+    this.maxPriceAge = parseInt(process.env.MAX_PRICE_AGE || '5000');
+    this.priceSources = (process.env.PRICE_SOURCES || 'coingecko,chainlink,dex').split(',');
+    this.confidenceThreshold = parseFloat(process.env.PRICE_CONFIDENCE_THRESHOLD || '0.8');
+
+    this.initializeSupportedPairs();
+  }
+
+  /**
+   * Initialize supported token pairs
+   */
+  private initializeSupportedPairs(): void {
+    this.supportedPairs = [
+      {
+        baseToken: 'ETH',
+        quoteToken: 'USDC',
+        baseTokenAddress: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // WETH
+        quoteTokenAddress: '0xA0b86a33E6441b8c4C0C0C0C0C0C0C0C0C0C0C0',
+        baseTokenDecimals: 18,
+        quoteTokenDecimals: 6,
+        baseTokenSymbol: 'ETH',
+        quoteTokenSymbol: 'USDC'
+      },
+      {
+        baseToken: 'AVAX',
+        quoteToken: 'USDC',
+        baseTokenAddress: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7',
+        quoteTokenAddress: '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',
+        baseTokenDecimals: 18,
+        quoteTokenDecimals: 6,
+        baseTokenSymbol: 'AVAX',
+        quoteTokenSymbol: 'USDC'
+      },
+      {
+        baseToken: 'WETH',
+        quoteToken: 'USDC',
+        baseTokenAddress: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+        quoteTokenAddress: '0xA0b86a33E6441b8c4C0C0C0C0C0C0C0C0C0C0C0',
+        baseTokenDecimals: 18,
+        quoteTokenDecimals: 6,
+        baseTokenSymbol: 'WETH',
+        quoteTokenSymbol: 'USDC'
+      }
+    ];
   }
 
   /**
@@ -25,18 +84,27 @@ export class PriceMonitoringService extends EventEmitter {
       return;
     }
 
-    logger.info('Starting price monitoring service');
-    this.isRunning = true;
-
-    // Initial price collection
-    await this.collectPrices();
-
-    // Set up periodic price collection
-    this.updateInterval = setInterval(async () => {
-      await this.collectPrices();
-    }, tradingConfig.monitoring.priceUpdateInterval);
-
-    logger.info('Price monitoring service started successfully');
+    try {
+      logger.info('Starting price monitoring service...');
+      
+      // Initialize exchanges
+      await this.initializeExchanges();
+      
+      // Start price update loop
+      this.startPriceUpdateLoop();
+      
+      // Start price aggregation
+      this.startPriceAggregation();
+      
+      this.isRunning = true;
+      logger.info('Price monitoring service started successfully');
+      
+      this.emit('serviceStarted');
+      
+    } catch (error) {
+      logger.error('Failed to start price monitoring service:', error);
+      throw error;
+    }
   }
 
   /**
@@ -48,337 +116,467 @@ export class PriceMonitoringService extends EventEmitter {
       return;
     }
 
-    logger.info('Stopping price monitoring service');
-    this.isRunning = false;
-
-    if (this.updateInterval) {
-      clearInterval(this.updateInterval);
-      this.updateInterval = null;
+    try {
+      logger.info('Stopping price monitoring service...');
+      
+      this.isRunning = false;
+      
+      // Clear intervals
+      if (this.priceUpdateTimer) {
+        clearInterval(this.priceUpdateTimer);
+      }
+      
+      if (this.aggregationTimer) {
+        clearInterval(this.aggregationTimer);
+      }
+      
+      logger.info('Price monitoring service stopped successfully');
+      
+      this.emit('serviceStopped');
+      
+    } catch (error) {
+      logger.error('Failed to stop price monitoring service:', error);
+      throw error;
     }
+  }
 
-    logger.info('Price monitoring service stopped successfully');
+  private priceUpdateTimer: NodeJS.Timeout | null = null;
+  private aggregationTimer: NodeJS.Timeout | null = null;
+
+  /**
+   * Start price update loop
+   */
+  private startPriceUpdateLoop(): void {
+    this.priceUpdateTimer = setInterval(async () => {
+      try {
+        await this.updateAllPrices();
+      } catch (error) {
+        logger.error('Error in price update loop:', error);
+        this.metrics.recordError('price_update_loop', error);
+      }
+    }, this.updateInterval);
   }
 
   /**
-   * Collect prices from all configured exchanges
+   * Start price aggregation
    */
-  private async collectPrices(): Promise<void> {
+  private startPriceAggregation(): void {
+    this.aggregationTimer = setInterval(async () => {
+      try {
+        await this.aggregatePrices();
+      } catch (error) {
+        logger.error('Error in price aggregation:', error);
+        this.metrics.recordError('price_aggregation', error);
+      }
+    }, this.updateInterval * 2);
+  }
+
+  /**
+   * Initialize exchanges
+   */
+  private async initializeExchanges(): Promise<void> {
     try {
-      const tokenPairs = await getRepository(TokenPair).find({
-        where: { isActive: true }
+      // Initialize major exchanges
+      const exchanges: Exchange[] = [
+        {
+          id: 'uniswap_v3',
+          name: 'Uniswap V3',
+          type: 'DEX',
+          network: 'Ethereum',
+          rpcUrl: process.env.UNISWAP_V3_RPC || 'https://mainnet.infura.io/v3/your_key',
+          chainId: 1,
+          isActive: true,
+          tradingFees: { maker: 0.003, taker: 0.003, gasMultiplier: 1.0 },
+          withdrawalFees: { baseToken: 0, quoteToken: 0 },
+          minOrderSize: 0.001,
+          maxOrderSize: 1000000,
+          supportedTokens: ['ETH', 'USDC', 'WETH'],
+          liquidityPools: []
+        },
+        {
+          id: 'trader_joe',
+          name: 'Trader Joe',
+          type: 'DEX',
+          network: 'Avalanche',
+          rpcUrl: process.env.TRADER_JOE_RPC || 'https://api.avax.network/ext/bc/C/rpc',
+          chainId: 43114,
+          isActive: true,
+          tradingFees: { maker: 0.003, taker: 0.003, gasMultiplier: 1.0 },
+          withdrawalFees: { baseToken: 0, quoteToken: 0 },
+          minOrderSize: 0.001,
+          maxOrderSize: 1000000,
+          supportedTokens: ['AVAX', 'USDC', 'WETH'],
+          liquidityPools: []
+        },
+        {
+          id: 'pangolin',
+          name: 'Pangolin',
+          type: 'DEX',
+          network: 'Avalanche',
+          rpcUrl: process.env.PANGOLIN_RPC || 'https://api.avax.network/ext/bc/C/rpc',
+          chainId: 43114,
+          isActive: true,
+          tradingFees: { maker: 0.003, taker: 0.003, gasMultiplier: 1.0 },
+          withdrawalFees: { baseToken: 0, quoteToken: 0 },
+          minOrderSize: 0.001,
+          maxOrderSize: 1000000,
+          supportedTokens: ['AVAX', 'USDC', 'WETH'],
+          liquidityPools: []
+        }
+      ];
+
+      exchanges.forEach(exchange => {
+        this.exchanges.set(exchange.id, exchange);
       });
 
-      const exchanges = await getRepository(Exchange).find({
-        where: { isActive: true, isHealthy: true }
-      });
+      logger.info(`Initialized ${exchanges.length} exchanges`);
+      
+    } catch (error) {
+      logger.error('Error initializing exchanges:', error);
+      throw error;
+    }
+  }
 
-      const pricePromises = tokenPairs.flatMap(pair =>
-        exchanges.map(exchange => this.fetchPrice(pair, exchange))
-      );
+  /**
+   * Update all prices from all sources
+   */
+  private async updateAllPrices(): Promise<void> {
+    try {
+      const updatePromises: Promise<void>[] = [];
 
-      const prices = await Promise.allSettled(pricePromises);
-      const validPrices: PriceData[] = [];
-
-      for (const result of prices) {
-        if (result.status === 'fulfilled' && result.value) {
-          validPrices.push(result.value);
-          this.priceCache.set(this.getCacheKey(result.value), result.value);
+      // Update prices from each exchange
+      for (const exchange of this.exchanges.values()) {
+        if (exchange.isActive) {
+          updatePromises.push(this.updateExchangePrices(exchange));
         }
       }
 
-      // Save prices to database
-      if (validPrices.length > 0) {
-        await this.savePrices(validPrices);
+      // Update prices from external APIs
+      if (this.priceSources.includes('coingecko')) {
+        updatePromises.push(this.updateCoinGeckoPrices());
       }
 
-      // Detect arbitrage opportunities
-      await this.detectArbitrageOpportunities();
+      if (this.priceSources.includes('chainlink')) {
+        updatePromises.push(this.updateChainlinkPrices());
+      }
 
-      this.lastUpdate = new Date();
-      this.emit('pricesUpdated', validPrices);
+      // Wait for all updates to complete
+      await Promise.allSettled(updatePromises);
 
+      // Emit price update event
+      const allPrices = Array.from(this.priceCache.values());
+      this.emit('pricesUpdated', allPrices);
+
+      // Record metrics
+      this.metrics.recordPricesUpdated(allPrices.length);
+      
     } catch (error) {
-      logger.error('Error collecting prices:', error);
-      this.emit('error', error);
+      logger.error('Error updating all prices:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update prices from a specific exchange
+   */
+  private async updateExchangePrices(exchange: Exchange): Promise<void> {
+    try {
+      for (const pair of this.supportedPairs) {
+        if (exchange.supportedTokens.includes(pair.baseToken) && 
+            exchange.supportedTokens.includes(pair.quoteToken)) {
+          
+          const price = await this.fetchExchangePrice(exchange, pair);
+          if (price) {
+            this.updatePriceCache(price);
+          }
+        }
+      }
+    } catch (error) {
+      logger.error(`Error updating prices for exchange ${exchange.name}:`, error);
     }
   }
 
   /**
    * Fetch price from a specific exchange
    */
-  private async fetchPrice(tokenPair: TokenPair, exchange: Exchange): Promise<PriceData | null> {
+  private async fetchExchangePrice(exchange: Exchange, pair: TokenPair): Promise<PriceData | null> {
     try {
-      let priceData: any = null;
-
-      switch (exchange.type) {
-        case ExchangeType.TRADERJOE:
-          priceData = await this.fetchTraderJoePrice(tokenPair, exchange);
-          break;
-        case ExchangeType.PANGOLIN:
-          priceData = await this.fetchPangolinPrice(tokenPair, exchange);
-          break;
-        case ExchangeType.SUSHI:
-          priceData = await this.fetchSushiPrice(tokenPair, exchange);
-          break;
-        default:
-          logger.warn(`Unsupported exchange type: ${exchange.type}`);
-          return null;
-      }
-
-      if (!priceData) {
-        return null;
-      }
-
-      // Validate price data
-      if (!this.isValidPrice(priceData)) {
-        logger.warn(`Invalid price data from ${exchange.name} for ${tokenPair.baseToken}/${tokenPair.quoteToken}`);
-        return null;
-      }
-
-      // Check for price anomalies
-      const isAnomalous = this.detectPriceAnomaly(priceData, tokenPair, exchange);
-
-      const price = new PriceData();
-      price.tokenPairId = tokenPair.id;
-      price.exchangeId = exchange.id;
-      price.price = priceData.price;
-      price.volume24h = priceData.volume24h || 0;
-      price.liquidity = priceData.liquidity || 0;
-      price.high24h = priceData.high24h;
-      price.low24h = priceData.low24h;
-      price.priceChange24h = priceData.priceChange24h;
-      price.volumeChange24h = priceData.volumeChange24h;
-      price.timestamp = new Date();
-      price.source = exchange.name;
-      price.isAnomalous = isAnomalous;
-      price.metadata = priceData.metadata;
-
-      return price;
-
+      // This would implement actual exchange API calls
+      // For now, return mock data
+      const mockPrice = this.generateMockPrice(exchange, pair);
+      
+      // In production, this would make actual API calls:
+      // - Uniswap V3: Use Quoter contract
+      // - Trader Joe: Use Router contract
+      // - Pangolin: Use Router contract
+      
+      return mockPrice;
+      
     } catch (error) {
-      logger.error(`Error fetching price from ${exchange.name} for ${tokenPair.baseToken}/${tokenPair.quoteToken}:`, error);
+      logger.error(`Error fetching price from ${exchange.name} for ${pair.baseToken}/${pair.quoteToken}:`, error);
       return null;
     }
   }
 
   /**
-   * Fetch price from TraderJoe
+   * Generate mock price data for testing
    */
-  private async fetchTraderJoePrice(tokenPair: TokenPair, exchange: Exchange): Promise<any> {
-    const response = await axios.get(`${exchange.apiEndpoint}/pairs/${tokenPair.baseTokenAddress}/${tokenPair.quoteTokenAddress}`);
+  private generateMockPrice(exchange: Exchange, pair: TokenPair): PriceData {
+    const basePrice = this.getBasePrice(pair.baseToken);
+    const variation = (Math.random() - 0.5) * 0.02; // ±1% variation
     
-    if (response.data && response.data.data) {
-      const data = response.data.data;
-      return {
-        price: parseFloat(data.priceUsd || data.price),
-        volume24h: parseFloat(data.volume24h || 0),
-        liquidity: parseFloat(data.liquidity || 0),
-        high24h: parseFloat(data.high24h),
-        low24h: parseFloat(data.low24h),
-        priceChange24h: parseFloat(data.priceChange24h || 0),
-        volumeChange24h: parseFloat(data.volumeChange24h || 0),
-        metadata: data
-      };
-    }
-    return null;
+    return {
+      exchange: exchange.id,
+      baseToken: pair.baseToken,
+      quoteToken: pair.quoteToken,
+      price: basePrice * (1 + variation),
+      volume24h: Math.random() * 1000000 + 100000,
+      liquidity: Math.random() * 5000000 + 1000000,
+      timestamp: new Date(),
+      source: 'api',
+      confidence: 0.9 + Math.random() * 0.1,
+      lastUpdate: new Date()
+    };
   }
 
   /**
-   * Fetch price from Pangolin
+   * Get base price for a token
    */
-  private async fetchPangolinPrice(tokenPair: TokenPair, exchange: Exchange): Promise<any> {
-    const response = await axios.get(`${exchange.apiEndpoint}/pairs/${tokenPair.baseTokenAddress}/${tokenPair.quoteTokenAddress}`);
+  private getBasePrice(token: string): number {
+    const basePrices: Record<string, number> = {
+      'ETH': 2000,
+      'AVAX': 50,
+      'WETH': 2000,
+      'USDC': 1,
+      'USDT': 1
+    };
     
-    if (response.data) {
-      const data = response.data;
-      return {
-        price: parseFloat(data.price || 0),
-        volume24h: parseFloat(data.volume24h || 0),
-        liquidity: parseFloat(data.liquidity || 0),
-        high24h: parseFloat(data.high24h),
-        low24h: parseFloat(data.low24h),
-        priceChange24h: parseFloat(data.priceChange24h || 0),
-        volumeChange24h: parseFloat(data.volumeChange24h || 0),
-        metadata: data
-      };
-    }
-    return null;
+    return basePrices[token] || 1;
   }
 
   /**
-   * Fetch price from Sushi
+   * Update CoinGecko prices
    */
-  private async fetchSushiPrice(tokenPair: TokenPair, exchange: Exchange): Promise<any> {
-    const response = await axios.get(`${exchange.apiEndpoint}/pairs/${tokenPair.baseTokenAddress}/${tokenPair.quoteTokenAddress}`);
-    
-    if (response.data) {
-      const data = response.data;
-      return {
-        price: parseFloat(data.price || 0),
-        volume24h: parseFloat(data.volume24h || 0),
-        liquidity: parseFloat(data.liquidity || 0),
-        high24h: parseFloat(data.high24h),
-        low24h: parseFloat(data.low24h),
-        priceChange24h: parseFloat(data.priceChange24h || 0),
-        volumeChange24h: parseFloat(data.volumeChange24h || 0),
-        metadata: data
-      };
-    }
-    return null;
-  }
-
-  /**
-   * Save prices to database
-   */
-  private async savePrices(prices: PriceData[]): Promise<void> {
+  private async updateCoinGeckoPrices(): Promise<void> {
     try {
-      const priceRepository = getRepository(PriceData);
-      await priceRepository.save(prices);
-      logger.debug(`Saved ${prices.length} price records to database`);
+      const apiKey = process.env.COINGECKO_API_KEY;
+      const apiUrl = process.env.COINGECKO_API_URL || 'https://api.coingecko.com/api/v3';
+      
+      for (const pair of this.supportedPairs) {
+        try {
+          const response = await fetch(
+            `${apiUrl}/simple/price?ids=${pair.baseToken.toLowerCase()}&vs_currencies=usd&x_cg_demo_api_key=${apiKey}`,
+            { timeout: 5000 }
+          );
+          
+          if (response.ok) {
+            const data = await response.json();
+            const price = data[pair.baseToken.toLowerCase()]?.usd;
+            
+            if (price) {
+              const priceData: PriceData = {
+                exchange: 'coingecko',
+                baseToken: pair.baseToken,
+                quoteToken: 'USD',
+                price,
+                volume24h: 0, // Would need separate API call
+                liquidity: 0,
+                timestamp: new Date(),
+                source: 'api',
+                confidence: 0.95,
+                lastUpdate: new Date()
+              };
+              
+              this.updatePriceCache(priceData);
+            }
+          }
+        } catch (error) {
+          logger.warn(`Failed to fetch CoinGecko price for ${pair.baseToken}:`, error);
+        }
+      }
+      
     } catch (error) {
-      logger.error('Error saving prices to database:', error);
+      logger.error('Error updating CoinGecko prices:', error);
+    }
+  }
+
+  /**
+   * Update Chainlink prices
+   */
+  private async updateChainlinkPrices(): Promise<void> {
+    try {
+      // This would implement Chainlink price feed calls
+      // For now, just log that it's not implemented
+      logger.debug('Chainlink price updates not yet implemented');
+      
+    } catch (error) {
+      logger.error('Error updating Chainlink prices:', error);
+    }
+  }
+
+  /**
+   * Update price cache
+   */
+  private updatePriceCache(priceData: PriceData): void {
+    const cacheKey = `${priceData.exchange}_${priceData.baseToken}_${priceData.quoteToken}`;
+    
+    // Check if price is too old
+    const priceAge = Date.now() - priceData.timestamp.getTime();
+    if (priceAge > this.maxPriceAge) {
+      logger.warn(`Price for ${cacheKey} is too old: ${priceAge}ms`);
+      return;
+    }
+    
+    // Update cache
+    this.priceCache.set(cacheKey, priceData);
+    
+    // Emit price update event
+    this.emit('priceUpdated', priceData);
+  }
+
+  /**
+   * Aggregate prices and detect opportunities
+   */
+  private async aggregatePrices(): Promise<void> {
+    try {
+      const aggregatedPrices = new Map<string, PriceData[]>();
+      
+      // Group prices by token pair
+      for (const price of this.priceCache.values()) {
+        const pairKey = `${price.baseToken}_${price.quoteToken}`;
+        
+        if (!aggregatedPrices.has(pairKey)) {
+          aggregatedPrices.set(pairKey, []);
+        }
+        
+        aggregatedPrices.get(pairKey)!.push(price);
+      }
+      
+      // Analyze each pair for price discrepancies
+      for (const [pairKey, prices] of aggregatedPrices) {
+        if (prices.length >= 2) {
+          const opportunities = this.detectPriceDiscrepancies(pairKey, prices);
+          
+          if (opportunities.length > 0) {
+            this.emit('opportunitiesDetected', opportunities);
+            this.metrics.recordOpportunitiesDetected(opportunities.length);
+          }
+        }
+      }
+      
+    } catch (error) {
+      logger.error('Error aggregating prices:', error);
       throw error;
     }
   }
 
   /**
-   * Detect arbitrage opportunities from current prices
+   * Detect price discrepancies for arbitrage opportunities
    */
-  private async detectArbitrageOpportunities(): Promise<void> {
+  private detectPriceDiscrepancies(pairKey: string, prices: PriceData[]): any[] {
+    const opportunities: any[] = [];
+    
     try {
-      const tokenPairs = await getRepository(TokenPair).find({
-        where: { isActive: true }
-      });
-
-      const opportunities: PriceComparison[] = [];
-
-      for (const pair of tokenPairs) {
-        const pairPrices = Array.from(this.priceCache.values())
-          .filter(price => price.tokenPairId === pair.id)
-          .sort((a, b) => a.price - b.price);
-
-        if (pairPrices.length >= 2) {
-          const lowestPrice = pairPrices[0];
-          const highestPrice = pairPrices[pairPrices.length - 1];
-
-          const priceDifference = highestPrice.price - lowestPrice.price;
-          const priceDifferencePercent = (priceDifference / lowestPrice.price) * 100;
-
-          if (priceDifferencePercent >= tradingConfig.minProfitThreshold) {
-            const opportunity: PriceComparison = {
-              tokenPair: `${pair.baseToken}/${pair.quoteToken}`,
-              sourceExchange: lowestPrice.source,
-              targetExchange: highestPrice.source,
-              sourcePrice: lowestPrice.price,
-              targetPrice: highestPrice.price,
+      // Sort prices by value
+      const sortedPrices = prices.sort((a, b) => a.price - b.price);
+      
+      // Check for significant price differences
+      for (let i = 0; i < sortedPrices.length - 1; i++) {
+        for (let j = i + 1; j < sortedPrices.length; j++) {
+          const lowPrice = sortedPrices[i];
+          const highPrice = sortedPrices[j];
+          
+          const priceDifference = highPrice.price - lowPrice.price;
+          const priceDifferencePercent = (priceDifference / lowPrice.price) * 100;
+          
+          // Check if difference is significant (configurable threshold)
+          const minDifferencePercent = parseFloat(process.env.MIN_PROFIT_THRESHOLD || '0.5');
+          
+          if (priceDifferencePercent >= minDifferencePercent) {
+            const opportunity = {
+              pairKey,
+              buyExchange: lowPrice.exchange,
+              sellExchange: highPrice.exchange,
+              buyPrice: lowPrice.price,
+              sellPrice: highPrice.price,
               priceDifference,
               priceDifferencePercent,
-              volume24h: Math.min(lowestPrice.volume24h, highestPrice.volume24h),
-              liquidity: Math.min(lowestPrice.liquidity, highestPrice.liquidity),
-              timestamp: new Date()
+              timestamp: new Date(),
+              confidence: Math.min(lowPrice.confidence, highPrice.confidence)
             };
-
+            
             opportunities.push(opportunity);
           }
         }
       }
-
-      if (opportunities.length > 0) {
-        this.emit('opportunitiesDetected', opportunities);
-        logger.info(`Detected ${opportunities.length} arbitrage opportunities`);
-      }
-
+      
     } catch (error) {
-      logger.error('Error detecting arbitrage opportunities:', error);
+      logger.error(`Error detecting price discrepancies for ${pairKey}:`, error);
     }
-  }
-
-  /**
-   * Validate price data
-   */
-  private isValidPrice(priceData: any): boolean {
-    return (
-      priceData &&
-      typeof priceData.price === 'number' &&
-      priceData.price > 0 &&
-      !isNaN(priceData.price) &&
-      isFinite(priceData.price)
-    );
-  }
-
-  /**
-   * Detect price anomalies
-   */
-  private detectPriceAnomaly(priceData: any, tokenPair: TokenPair, exchange: Exchange): boolean {
-    // Simple anomaly detection based on price deviation
-    const cacheKey = this.getCacheKey({ tokenPairId: tokenPair.id, exchangeId: exchange.id } as PriceData);
-    const cachedPrice = this.priceCache.get(cacheKey);
-
-    if (cachedPrice) {
-      const priceChange = Math.abs(priceData.price - cachedPrice.price) / cachedPrice.price;
-      return priceChange > 0.1; // 10% price change threshold
-    }
-
-    return false;
-  }
-
-  /**
-   * Get cache key for price data
-   */
-  private getCacheKey(priceData: PriceData): string {
-    return `${priceData.tokenPairId}_${priceData.exchangeId}`;
+    
+    return opportunities;
   }
 
   /**
    * Get current prices for a token pair
    */
-  async getCurrentPrices(tokenPairId: string): Promise<PriceData[]> {
-    const prices = Array.from(this.priceCache.values())
-      .filter(price => price.tokenPairId === tokenPairId);
+  getPricesForPair(baseToken: string, quoteToken: string): PriceData[] {
+    const prices: PriceData[] = [];
     
-    return prices.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+    for (const price of this.priceCache.values()) {
+      if (price.baseToken === baseToken && price.quoteToken === quoteToken) {
+        prices.push(price);
+      }
+    }
+    
+    return prices;
   }
 
   /**
-   * Get price history for a token pair and exchange
+   * Get all current prices
    */
-  async getPriceHistory(
-    tokenPairId: string,
-    exchangeId: string,
-    hours: number = 24
-  ): Promise<PriceData[]> {
-    const priceRepository = getRepository(PriceData);
-    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-
-    return await priceRepository.find({
-      where: {
-        tokenPairId,
-        exchangeId,
-        timestamp: { $gte: since } as any
-      },
-      order: { timestamp: 'ASC' }
-    });
+  getAllPrices(): PriceData[] {
+    return Array.from(this.priceCache.values());
   }
 
   /**
-   * Get system status
+   * Get price for specific exchange and pair
    */
-  getStatus(): {
-    isRunning: boolean;
-    lastUpdate: Date;
-    cacheSize: number;
-    activePairs: number;
-  } {
-    const activePairs = new Set(Array.from(this.priceCache.values()).map(p => p.tokenPairId)).size;
+  getPrice(exchange: string, baseToken: string, quoteToken: string): PriceData | null {
+    const cacheKey = `${exchange}_${baseToken}_${quoteToken}`;
+    return this.priceCache.get(cacheKey) || null;
+  }
 
+  /**
+   * Get service status
+   */
+  getStatus(): any {
     return {
       isRunning: this.isRunning,
-      lastUpdate: this.lastUpdate,
-      cacheSize: this.priceCache.size,
-      activePairs
+      exchangesCount: this.exchanges.size,
+      supportedPairsCount: this.supportedPairs.length,
+      priceCacheSize: this.priceCache.size,
+      updateInterval: this.updateInterval,
+      maxPriceAge: this.maxPriceAge,
+      priceSources: this.priceSources,
+      confidenceThreshold: this.confidenceThreshold
     };
   }
-}
 
-// Export singleton instance
-export const priceMonitoringService = new PriceMonitoringService();
+  /**
+   * Clean up resources
+   */
+  async cleanup(): Promise<void> {
+    try {
+      await this.stop();
+      
+      // Clear cache
+      this.priceCache.clear();
+      
+      logger.info('Price monitoring service cleaned up');
+      
+    } catch (error) {
+      logger.error('Error cleaning up price monitoring service:', error);
+    }
+  }
+}
